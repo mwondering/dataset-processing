@@ -82,7 +82,7 @@ joint/body order.
 Run one motion on CPU for validation:
 
 ```bash
-/home/lenovo/workspace/UNICTL/heft/.venv/bin/python \
+uv run --frozen python \
   scripts/process_isaaclab_pos36.py \
   --input /home/lenovo/DATASETS/Data10k/dance1_subject2_0_3945/motion.npz \
   --output-dir outputs/data10k_heft_smoothed \
@@ -94,15 +94,18 @@ import or install IsaacLab, mjlab, MuJoCo, HEFT, Warp, or NCCL distributed
 communication:
 
 ```bash
-python -m venv .venv-cluster
-source .venv-cluster/bin/activate
-python -m pip install -r requirements-cluster.txt
+uv sync --frozen
+uv run --frozen python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
+
+The lock file installs Python 3.10, NumPy, and PyTorch 2.11 from the official
+CUDA 12.8 wheel index.  Tests remain optional: use
+`uv sync --frozen --extra test` followed by `uv run --frozen pytest -q`.
 
 Process a complete dataset on one GPU:
 
 ```bash
-python \
+uv run --frozen python \
   scripts/process_isaaclab_pos36.py \
   --input /path/to/Data10k \
   --output-dir /path/to/Data10k_heft_smoothed \
@@ -113,7 +116,7 @@ python \
 Process one dataset on every visible GPU, or select local GPU IDs explicitly:
 
 ```bash
-python scripts/process_dataset_multigpu.py \
+uv run --frozen python scripts/process_dataset_multigpu.py \
   --input /path/to/Data10k \
   --output-dir /path/to/Data10k_heft_smoothed \
   --gpus 0,1,2,3 \
