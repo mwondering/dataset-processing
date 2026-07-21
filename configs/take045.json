@@ -1,0 +1,6 @@
+{
+  "input_csv": "/home/lenovo/DATASETS/LAFAN1_Retargeting_Dataset/g1/20260104_mocap/D0106_XY_JinJiDuLi_2_2_4_001_SK00_045/Retargeting/Take_045_Skeleton0_main.csv",
+  "input_fps": 120.0,
+  "output_fps": 50.0,
+  "reference_schema_npz": "/home/lenovo/DATASETS/Data10k/dance1_subject2_0_3945/motion.npz"
+}
