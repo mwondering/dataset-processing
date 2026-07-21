@@ -149,7 +149,9 @@ atomically, so `--skip-existing` safely resumes an interrupted job.  Use
 Large dataset startup follows the same indexing strategy as SP_Tracking's
 LargeDataset loader.  In `--scan-backend auto` mode the launcher first uses
 `fd` or Debian's `fdfind` when either is available, otherwise it falls back to
-a parallel `os.walk`.  NPZ length/FPS metadata is read once with a process pool
+a parallel `os.walk`.  Every `.npz` and `.npy` candidate is validated and
+processed regardless of its filename; nonstandard names are never silently
+dropped.  NPZ length/FPS metadata is read once with a process pool
 (the default), then embedded in each GPU's JSON manifest so workers do not scan
 the files again.  The complete snapshot is atomically cached at
 `OUTPUT/_cluster/input_index.json`; resumed runs load it directly and only

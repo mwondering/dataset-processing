@@ -25,10 +25,11 @@ from scripts.process_isaaclab_pos36 import (  # noqa: E402
     _atomic_write_json,
     inspect_motion,
     output_path_for,
+    validate_unique_output_paths,
 )
 
 
-DATASET_INDEX_VERSION = 2
+DATASET_INDEX_VERSION = 3
 
 
 def parse_gpu_ids(value: str | None) -> list[int]:
@@ -98,12 +99,10 @@ def tail(path: Path, lines: int = 40) -> str:
     return "\n".join(content[-lines:])
 
 
-def _prefer_motion_npz(paths: list[Path]) -> list[Path]:
-    motion_paths = [path for path in paths if path.name == "motion.npz"]
-    selected = motion_paths if motion_paths else paths
-    if not selected:
+def _all_motion_candidates(paths: list[Path]) -> list[Path]:
+    if not paths:
         raise RuntimeError("No .npz or .npy motions found")
-    return sorted(selected)
+    return sorted(paths)
 
 
 def _collect_motion_files_os_walk(root: Path) -> tuple[list[Path], int, int]:
@@ -162,7 +161,7 @@ def _scan_inputs_python(root: Path, *, workers: int, log_interval: float) -> lis
         directory_count = child_directory_count
         file_count = child_file_count
 
-    selected = _prefer_motion_npz(paths)
+    selected = _all_motion_candidates(paths)
     print(
         f"path scan done: backend=python dirs={directory_count:,} files={file_count:,} "
         f"motions={len(selected):,} elapsed={time.perf_counter() - start:.2f}s",
@@ -226,7 +225,7 @@ def _scan_inputs_fd(
     code = process.wait()
     if code != 0:
         raise subprocess.CalledProcessError(code, command, stderr=stderr)
-    selected = _prefer_motion_npz(paths)
+    selected = _all_motion_candidates(paths)
     print(
         f"path scan done: backend=fd motions={len(selected):,} "
         f"elapsed={time.perf_counter() - start:.2f}s",
@@ -631,6 +630,8 @@ def main() -> None:
                 specs=specs,
             )
             print(f"dataset index wrote: {index_path}", flush=True)
+
+    validate_unique_output_paths(input_root, output_root, specs)
 
     skipped_existing = 0
     if args.skip_existing:

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import json
 import numpy as np
 import pytest
 
@@ -7,7 +8,13 @@ torch = pytest.importorskip("torch")
 
 from fk_compare.g1_fk import G1PureTorchFK
 from fk_compare.heft_batch import DATA10K_TERMS
-from scripts.process_isaaclab_pos36 import MotionSpec, inspect_motion, read_spec_manifest
+from scripts.process_isaaclab_pos36 import (
+    MotionSpec,
+    discover_inputs,
+    inspect_motion,
+    read_spec_manifest,
+    validate_unique_output_paths,
+)
 from scripts.process_dataset_multigpu import (
     balanced_shards,
     build_progress_lines,
@@ -84,7 +91,7 @@ def test_global_progress_aggregates_worker_frames_and_motions():
     assert lines[6] == "GPU1     6 / 10 motions"
 
 
-def test_python_scanner_preserves_motion_npz_preference(tmp_path):
+def test_python_scanner_includes_nonstandard_motion_filenames(tmp_path):
     motion = tmp_path / "a" / "motion.npz"
     unrelated = tmp_path / "b" / "clip.npz"
     motion.parent.mkdir(parents=True)
@@ -100,7 +107,30 @@ def test_python_scanner_preserves_motion_npz_preference(tmp_path):
         log_interval=0.0,
     )
 
-    assert paths == [motion]
+    assert paths == [motion, unrelated]
+
+
+def test_standalone_scanner_includes_nonstandard_motion_filenames(tmp_path):
+    motion = tmp_path / "a" / "motion.npz"
+    named = tmp_path / "b" / "dance_take_12.npz"
+    motion.parent.mkdir(parents=True)
+    named.parent.mkdir(parents=True)
+    motion.touch()
+    named.touch()
+
+    assert discover_inputs(tmp_path) == [motion, named]
+
+
+def test_output_collision_is_rejected_before_processing(tmp_path):
+    input_root = tmp_path / "input"
+    output_root = tmp_path / "output"
+    specs = [
+        MotionSpec(input_root / "clip.npz", 4, 50.0, "pos36"),
+        MotionSpec(input_root / "clip.npy", 4, 50.0, "pos36"),
+    ]
+
+    with pytest.raises(ValueError, match="same output path"):
+        validate_unique_output_paths(input_root, output_root, specs)
 
 
 def test_dataset_index_and_worker_spec_manifest_round_trip(tmp_path):
@@ -136,6 +166,20 @@ def test_dataset_index_and_worker_spec_manifest_round_trip(tmp_path):
 
     assert cached == specs
     assert read_spec_manifest(manifest_path) == specs
+
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    assert payload["version"] == 3
+    payload["version"] = 2
+    index_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert (
+        load_dataset_index(
+            index_path,
+            input_root=input_root,
+            input_key="pos",
+            fallback_fps=None,
+        )
+        is None
+    )
 
 
 def test_process_metadata_reader_preserves_input_order(tmp_path):

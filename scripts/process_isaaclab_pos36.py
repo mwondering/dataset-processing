@@ -197,9 +197,6 @@ def discover_inputs(root: Path) -> list[Path]:
         if root.suffix not in (".npz", ".npy"):
             raise ValueError(f"Only .npz and .npy inputs are supported: {root}")
         return [root]
-    motion_paths = sorted(root.rglob("motion.npz"))
-    if motion_paths:
-        return motion_paths
     paths = sorted((*root.rglob("*.npz"), *root.rglob("*.npy")))
     if not paths:
         raise RuntimeError(f"No .npz or .npy motions found under {root}")
@@ -296,6 +293,29 @@ def output_path_for(input_root: Path, output_root: Path, source: Path) -> Path:
         if source.name != "motion.npz":
             relative = relative.with_name(f"{source.stem}.motion.npz")
     return output_root / relative
+
+
+def validate_unique_output_paths(
+    input_root: Path,
+    output_root: Path,
+    specs: list[MotionSpec],
+) -> None:
+    sources_by_output: dict[Path, Path] = {}
+    collisions: list[tuple[Path, Path, Path]] = []
+    for spec in specs:
+        output = output_path_for(input_root, output_root, spec.path)
+        previous = sources_by_output.setdefault(output, spec.path)
+        if previous != spec.path:
+            collisions.append((output, previous, spec.path))
+    if collisions:
+        preview = "\n".join(
+            f"output={output}\n  source_a={source_a}\n  source_b={source_b}"
+            for output, source_a, source_b in collisions[:10]
+        )
+        raise ValueError(
+            f"{len(collisions)} source pairs map to the same output path. "
+            f"Rename one source in each pair. First collisions:\n{preview}"
+        )
 
 
 def _atomic_save_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
@@ -534,6 +554,7 @@ def main() -> None:
     if any(spec.length < 1 for spec in specs):
         raise ValueError("Empty motions are not supported")
     discovered_motion_count = len(specs)
+    validate_unique_output_paths(input_root, output_root, specs)
     expected_outputs = [output_path_for(input_root, output_root, spec.path) for spec in specs]
     if args.skip_existing:
         specs = [spec for spec, output in zip(specs, expected_outputs) if not output.exists()]
