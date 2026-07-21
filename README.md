@@ -164,6 +164,13 @@ processes perform worse, switch to `--metadata-read-backend thread`; tune
 `--scan-workers` and `--metadata-read-chunksize` independently of GPU batch
 sizes.
 
+`--fps` is the fallback for source motions whose FPS field is absent or an
+empty array; it defaults to 50 Hz to match SP_Tracking LargeDataset behavior.
+A valid positive scalar stored in the NPZ always takes precedence.  Multi-value,
+NaN, zero, and negative FPS values remain hard errors.  The fallback count is
+reported during indexing and persisted in the dataset index, worker summaries,
+root summary, and per-motion difference reports.
+
 Each rebuilt `motion.npz` has a `motion.diff.json` sidecar containing exact
 per-file statistics for:
 

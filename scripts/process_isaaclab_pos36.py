@@ -40,7 +40,9 @@ from fk_compare.heft_batch import (  # noqa: E402
 from fk_compare.g1_fk import G1PureTorchFK  # noqa: E402
 
 
-REFERENCE_FIELDS = frozenset(("fps",) + DATA10K_TERMS)
+DATA10K_FIELDS = frozenset(DATA10K_TERMS)
+DEFAULT_FPS = 50.0
+SPEC_MANIFEST_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,7 @@ class MotionSpec:
     length: int
     fps: float
     kind: str
+    fps_was_defaulted: bool = False
 
 
 @dataclass
@@ -96,28 +99,57 @@ def _scalar_fps(value: np.ndarray, path: Path) -> float:
     return float(values[0])
 
 
+def _resolve_fps(
+    data: Any,
+    path: Path,
+    fallback_fps: float | None,
+) -> tuple[float, bool]:
+    if "fps" in data.files and np.asarray(data["fps"]).size > 0:
+        return _scalar_fps(data["fps"], path), False
+    if fallback_fps is None or not np.isfinite(fallback_fps) or fallback_fps <= 0.0:
+        raise ValueError(f"FPS is missing or empty in {path}; provide one positive --fps fallback")
+    return float(fallback_fps), True
+
+
 def inspect_motion(path: Path, *, input_key: str, fallback_fps: float | None) -> MotionSpec:
     if path.suffix == ".npy":
         array = np.load(path, mmap_mode="r", allow_pickle=False)
         if array.ndim != 2 or array.shape[1] != 36:
             raise ValueError(f"Expected [T,36] in {path}, got {array.shape}")
-        if fallback_fps is None:
-            raise ValueError(f"--fps is required for raw .npy input: {path}")
-        return MotionSpec(path=path, length=int(array.shape[0]), fps=float(fallback_fps), kind="pos36")
+        if fallback_fps is None or not np.isfinite(fallback_fps) or fallback_fps <= 0.0:
+            raise ValueError(f"One positive --fps fallback is required for raw .npy input: {path}")
+        return MotionSpec(
+            path=path,
+            length=int(array.shape[0]),
+            fps=float(fallback_fps),
+            kind="pos36",
+            fps_was_defaulted=True,
+        )
 
     with np.load(path, allow_pickle=False) as data:
-        if REFERENCE_FIELDS.issubset(data.files):
+        if DATA10K_FIELDS.issubset(data.files):
             length = int(data["joint_pos"].shape[0])
-            return MotionSpec(path=path, length=length, fps=_scalar_fps(data["fps"], path), kind="data10k")
+            fps, fps_was_defaulted = _resolve_fps(data, path, fallback_fps)
+            return MotionSpec(
+                path=path,
+                length=length,
+                fps=fps,
+                kind="data10k",
+                fps_was_defaulted=fps_was_defaulted,
+            )
         if input_key not in data.files:
             raise ValueError(f"Neither Data10k fields nor key '{input_key}' were found in {path}")
         array = data[input_key]
         if array.ndim != 2 or array.shape[1] != 36:
             raise ValueError(f"Expected {input_key}=[T,36] in {path}, got {array.shape}")
-        fps = _scalar_fps(data["fps"], path) if "fps" in data.files else fallback_fps
-        if fps is None:
-            raise ValueError(f"No FPS in {path}; provide --fps")
-        return MotionSpec(path=path, length=int(array.shape[0]), fps=float(fps), kind="pos36")
+        fps, fps_was_defaulted = _resolve_fps(data, path, fallback_fps)
+        return MotionSpec(
+            path=path,
+            length=int(array.shape[0]),
+            fps=fps,
+            kind="pos36",
+            fps_was_defaulted=fps_was_defaulted,
+        )
 
 
 def _validate_data10k_arrays(path: Path, data: Any) -> None:
@@ -200,7 +232,7 @@ def read_spec_manifest(path: Path) -> list[MotionSpec]:
 
     manifest = path.expanduser().resolve()
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    if int(payload.get("version", 0)) != 1:
+    if int(payload.get("version", 0)) != SPEC_MANIFEST_VERSION:
         raise ValueError(f"Unsupported spec manifest version: {manifest}")
     raw_specs = payload.get("motions")
     if not isinstance(raw_specs, list) or not raw_specs:
@@ -215,13 +247,22 @@ def read_spec_manifest(path: Path) -> list[MotionSpec]:
             length = int(raw["length"])
             fps = float(raw["fps"])
             kind = str(raw["kind"])
+            fps_was_defaulted = bool(raw.get("fps_was_defaulted", False))
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"Invalid motion entry {index} in {manifest}") from error
         if item.suffix not in (".npz", ".npy") or length < 1 or not np.isfinite(fps) or fps <= 0.0:
             raise ValueError(f"Invalid motion entry {index} in {manifest}: {raw!r}")
         if kind not in ("data10k", "pos36"):
             raise ValueError(f"Invalid motion kind in {manifest}: {kind!r}")
-        specs.append(MotionSpec(path=item.absolute(), length=length, fps=fps, kind=kind))
+        specs.append(
+            MotionSpec(
+                path=item.absolute(),
+                length=length,
+                fps=fps,
+                kind=kind,
+                fps_was_defaulted=fps_was_defaulted,
+            )
+        )
     if len({spec.path for spec in specs}) != len(specs):
         raise ValueError(f"Spec manifest contains duplicate paths: {manifest}")
     return specs
@@ -403,6 +444,7 @@ def process_batch(
             "output": str(output_path),
             "frames": length,
             "fps": source.spec.fps,
+            "fps_was_defaulted": source.spec.fps_was_defaulted,
             "minimal_input": {
                 "shape": [length, 36],
                 "layout": "root_pos[3] + root_quat_wxyz[4] + joint_pos_isaaclab_order[29]",
@@ -447,7 +489,12 @@ def main() -> None:
     parser.add_argument("--progress-path", type=Path, help="Optional atomic worker-progress JSON path.")
     parser.add_argument("--device", default="cuda", help="Torch device, normally cuda or cuda:0.")
     parser.add_argument("--input-key", default="pos", help="36D key for a non-Data10k NPZ.")
-    parser.add_argument("--fps", type=float, help="Fallback FPS for raw 36D files.")
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=DEFAULT_FPS,
+        help=f"Fallback when FPS is missing/empty (default: {DEFAULT_FPS:g} Hz).",
+    )
     parser.add_argument("--batch-frames", type=int, default=32768, help="Maximum padded frames per GPU batch.")
     parser.add_argument("--batch-motions", type=int, default=32)
     parser.add_argument("--io-workers", type=int, default=4)
@@ -578,6 +625,8 @@ def main() -> None:
         "skipped_existing_motion_count": skipped_motion_count,
         "motion_count": len(specs),
         "frame_count": total_frames,
+        "defaulted_fps_motion_count": sum(spec.fps_was_defaulted for spec in specs),
+        "fallback_fps": args.fps,
         "elapsed_seconds": elapsed,
         "frames_per_second": total_frames / elapsed if elapsed > 0.0 else None,
         "batch_frames_limit": args.batch_frames,

@@ -6,7 +6,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from fk_compare.g1_fk import G1PureTorchFK
-from scripts.process_isaaclab_pos36 import MotionSpec, read_spec_manifest
+from fk_compare.heft_batch import DATA10K_TERMS
+from scripts.process_isaaclab_pos36 import MotionSpec, inspect_motion, read_spec_manifest
 from scripts.process_dataset_multigpu import (
     balanced_shards,
     build_progress_lines,
@@ -107,7 +108,13 @@ def test_dataset_index_and_worker_spec_manifest_round_trip(tmp_path):
     input_root.mkdir()
     specs = [
         MotionSpec(path=input_root / "a" / "motion.npz", length=11, fps=50.0, kind="data10k"),
-        MotionSpec(path=input_root / "b.npy", length=7, fps=60.0, kind="pos36"),
+        MotionSpec(
+            path=input_root / "b.npy",
+            length=7,
+            fps=50.0,
+            kind="pos36",
+            fps_was_defaulted=True,
+        ),
     ]
     index_path = tmp_path / "index.json"
     manifest_path = tmp_path / "manifest.json"
@@ -150,3 +157,50 @@ def test_process_metadata_reader_preserves_input_order(tmp_path):
 
     assert [spec.path for spec in specs] == paths
     assert [spec.length for spec in specs] == [5, 3, 7]
+
+
+def _write_data10k_for_fps_test(path, *, fps_marker):
+    frames = 3
+    arrays = {
+        "joint_pos": np.zeros((frames, 29), dtype=np.float32),
+        "joint_vel": np.zeros((frames, 29), dtype=np.float32),
+        "body_pos_w": np.zeros((frames, 30, 3), dtype=np.float32),
+        "body_quat_w": np.zeros((frames, 30, 4), dtype=np.float32),
+        "body_lin_vel_w": np.zeros((frames, 30, 3), dtype=np.float32),
+        "body_ang_vel_w": np.zeros((frames, 30, 3), dtype=np.float32),
+    }
+    assert set(arrays) == set(DATA10K_TERMS)
+    if fps_marker is not None:
+        arrays["fps"] = np.asarray(fps_marker, dtype=np.float32)
+    np.savez(path, **arrays)
+
+
+@pytest.mark.parametrize("fps_marker", [None, []])
+def test_missing_or_empty_data10k_fps_uses_50hz_fallback(tmp_path, fps_marker):
+    path = tmp_path / "motion.npz"
+    _write_data10k_for_fps_test(path, fps_marker=fps_marker)
+
+    spec = inspect_motion(path, input_key="pos", fallback_fps=50.0)
+
+    assert spec.fps == 50.0
+    assert spec.fps_was_defaulted is True
+    assert spec.kind == "data10k"
+
+
+def test_valid_data10k_fps_is_not_overridden(tmp_path):
+    path = tmp_path / "motion.npz"
+    _write_data10k_for_fps_test(path, fps_marker=[60.0])
+
+    spec = inspect_motion(path, input_key="pos", fallback_fps=50.0)
+
+    assert spec.fps == 60.0
+    assert spec.fps_was_defaulted is False
+
+
+@pytest.mark.parametrize("fps_marker", [[0.0], [-1.0], [np.nan], [50.0, 50.0]])
+def test_invalid_nonempty_data10k_fps_remains_an_error(tmp_path, fps_marker):
+    path = tmp_path / "motion.npz"
+    _write_data10k_for_fps_test(path, fps_marker=fps_marker)
+
+    with pytest.raises(ValueError, match="Expected one positive FPS"):
+        inspect_motion(path, input_key="pos", fallback_fps=50.0)

@@ -19,11 +19,16 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.process_isaaclab_pos36 import (  # noqa: E402
+    DEFAULT_FPS,
     MotionSpec,
+    SPEC_MANIFEST_VERSION,
     _atomic_write_json,
     inspect_motion,
     output_path_for,
 )
+
+
+DATASET_INDEX_VERSION = 2
 
 
 def parse_gpu_ids(value: str | None) -> list[int]:
@@ -344,7 +349,7 @@ def load_dataset_index(
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if int(payload["version"]) != 1:
+        if int(payload["version"]) != DATASET_INDEX_VERSION:
             return None
         if payload["input"] != str(input_root) or payload["input_key"] != input_key:
             return None
@@ -356,6 +361,7 @@ def load_dataset_index(
                 length=int(raw["length"]),
                 fps=float(raw["fps"]),
                 kind=str(raw["kind"]),
+                fps_was_defaulted=bool(raw.get("fps_was_defaulted", False)),
             )
             for raw in payload["motions"]
         ]
@@ -378,18 +384,20 @@ def write_dataset_index(
     _atomic_write_json(
         path,
         {
-            "version": 1,
+            "version": DATASET_INDEX_VERSION,
             "input": str(input_root),
             "input_key": input_key,
             "fallback_fps": fallback_fps,
             "motion_count": len(specs),
             "frame_count": sum(spec.length for spec in specs),
+            "defaulted_fps_motion_count": sum(spec.fps_was_defaulted for spec in specs),
             "motions": [
                 {
                     "path": str(spec.path),
                     "length": spec.length,
                     "fps": spec.fps,
                     "kind": spec.kind,
+                    "fps_was_defaulted": spec.fps_was_defaulted,
                 }
                 for spec in specs
             ],
@@ -401,13 +409,14 @@ def write_spec_manifest(path: Path, specs: list[MotionSpec]) -> None:
     _atomic_write_json(
         path,
         {
-            "version": 1,
+            "version": SPEC_MANIFEST_VERSION,
             "motions": [
                 {
                     "path": str(spec.path),
                     "length": spec.length,
                     "fps": spec.fps,
                     "kind": spec.kind,
+                    "fps_was_defaulted": spec.fps_was_defaulted,
                 }
                 for spec in specs
             ],
@@ -493,7 +502,12 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--gpus", help="Comma-separated local CUDA IDs; default uses every visible GPU.")
     parser.add_argument("--input-key", default="pos")
-    parser.add_argument("--fps", type=float)
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=DEFAULT_FPS,
+        help=f"Fallback when FPS is missing/empty (default: {DEFAULT_FPS:g} Hz).",
+    )
     parser.add_argument("--batch-frames", type=int, default=262144)
     parser.add_argument("--batch-motions", type=int, default=32)
     parser.add_argument("--io-workers-per-gpu", type=int, default=4)
@@ -601,6 +615,13 @@ def main() -> None:
             chunksize=args.metadata_read_chunksize,
             log_interval=args.scan_log_interval,
         )
+        defaulted_fps_count = sum(spec.fps_was_defaulted for spec in specs)
+        if defaulted_fps_count:
+            print(
+                f"metadata FPS fallback: {defaulted_fps_count:,}/{len(specs):,} motions "
+                f"used {args.fps:g} Hz because fps was missing or empty",
+                flush=True,
+            )
         if not args.no_index_cache:
             write_dataset_index(
                 index_path,
@@ -687,6 +708,8 @@ def main() -> None:
         "motion_count": len(specs),
         "frame_count": sum(spec.length for spec in specs),
         "skipped_existing_motion_count": skipped_existing,
+        "defaulted_fps_motion_count": sum(spec.fps_was_defaulted for spec in specs),
+        "fallback_fps": args.fps,
         "dataset_index": None if args.no_index_cache else str(index_path),
         "dataset_index_hit": index_hit,
         "scan_backend": args.scan_backend,
