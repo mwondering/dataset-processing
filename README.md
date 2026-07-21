@@ -124,6 +124,7 @@ uv run --frozen python scripts/process_dataset_multigpu.py \
   --batch-motions 32 \
   --io-workers-per-gpu 4 \
   --scan-workers 16 \
+  --progress-interval 2 \
   --skip-existing
 ```
 
@@ -134,7 +135,12 @@ boundaries.  Motions are sorted by length to reduce padding, and CPU workers
 prefetch the next NPZ batch while the GPU processes the current batch.  The
 multi-GPU launcher scans the dataset once, balances motions by frame count,
 writes one manifest and log per GPU under `_cluster/`, and merges worker
-statistics into the root `summary.json`.  Each output file is written
+statistics into the root `summary.json`.  It also aggregates atomic
+`progress.gpu*.json` files into one global motions/frames/speed/ETA display.
+Interactive terminals refresh the same display in place every second; redirected
+output such as a Slurm log receives a plain-text snapshot every 10 seconds.
+Use `--progress-interval SECONDS` to override either default or `--no-progress`
+to disable it.  Each output file is written
 atomically, so `--skip-existing` safely resumes an interrupted job.  Use
 `--dry-run` to inspect the sharding plan without starting workers.
 

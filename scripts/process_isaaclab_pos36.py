@@ -248,6 +248,37 @@ def _atomic_write_json(path: Path, value: Any) -> None:
             temporary.unlink()
 
 
+def _write_worker_progress(
+    path: Path | None,
+    *,
+    device: torch.device,
+    status: str,
+    completed_motions: int,
+    completed_frames: int,
+    total_motions: int,
+    total_frames: int,
+    start: float,
+) -> None:
+    if path is None:
+        return
+    elapsed = time.perf_counter() - start
+    _atomic_write_json(
+        path,
+        {
+            "pid": os.getpid(),
+            "device": str(device),
+            "status": status,
+            "completed_motion_count": completed_motions,
+            "completed_frame_count": completed_frames,
+            "total_motion_count": total_motions,
+            "total_frame_count": total_frames,
+            "elapsed_seconds": elapsed,
+            "frames_per_second": completed_frames / elapsed if elapsed > 0.0 else None,
+            "updated_at_unix": time.time(),
+        },
+    )
+
+
 def pack_batch(sources: list[SourceMotion], device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch = len(sources)
     max_length = max(source.spec.length for source in sources)
@@ -375,6 +406,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, help="Optional newline-delimited subset of input files.")
     parser.add_argument("--summary-name", type=Path, default=Path("summary.json"))
+    parser.add_argument("--progress-path", type=Path, help="Optional atomic worker-progress JSON path.")
     parser.add_argument("--device", default="cuda", help="Torch device, normally cuda or cuda:0.")
     parser.add_argument("--input-key", default="pos", help="36D key for a non-Data10k NPZ.")
     parser.add_argument("--fps", type=float, help="Fallback FPS for raw 36D files.")
@@ -425,10 +457,35 @@ def main() -> None:
         preview = "\n".join(str(path) for path in conflicts[:10])
         raise FileExistsError(f"{len(conflicts)} outputs already exist; pass --overwrite. First paths:\n{preview}")
 
+    total_frames = sum(spec.length for spec in specs)
+    progress_path = args.progress_path.expanduser().resolve() if args.progress_path else None
+    progress_start = time.perf_counter()
+    completed_motions = 0
+    completed_frames = 0
+    _write_worker_progress(
+        progress_path,
+        device=device,
+        status="starting",
+        completed_motions=0,
+        completed_frames=0,
+        total_motions=len(specs),
+        total_frames=total_frames,
+        start=progress_start,
+    )
+
     fk_helper = build_fk_helper(device)
     aggregates: dict[str, dict[str, RunningStats]] = {}
-    total_frames = sum(spec.length for spec in specs)
     start = time.perf_counter()
+    _write_worker_progress(
+        progress_path,
+        device=device,
+        status="running",
+        completed_motions=0,
+        completed_frames=0,
+        total_motions=len(specs),
+        total_frames=total_frames,
+        start=progress_start,
+    )
     with ThreadPoolExecutor(max_workers=args.io_workers) as executor:
         def submit_loads(batch_specs: list[MotionSpec]):
             return [executor.submit(load_motion, spec, input_key=args.input_key) for spec in batch_specs]
@@ -448,6 +505,18 @@ def main() -> None:
                     fk_helper=fk_helper,
                     overwrite=args.overwrite,
                     aggregates=aggregates,
+                )
+                completed_motions += len(sources)
+                completed_frames += sum(source.spec.length for source in sources)
+                _write_worker_progress(
+                    progress_path,
+                    device=device,
+                    status="running",
+                    completed_motions=completed_motions,
+                    completed_frames=completed_frames,
+                    total_motions=len(specs),
+                    total_frames=total_frames,
+                    start=progress_start,
                 )
                 print(
                     f"batch {batch_index}/{len(batches)}: "
@@ -478,6 +547,16 @@ def main() -> None:
     }
     summary_path = output_root / args.summary_name
     _atomic_write_json(summary_path, summary)
+    _write_worker_progress(
+        progress_path,
+        device=device,
+        status="complete",
+        completed_motions=completed_motions,
+        completed_frames=completed_frames,
+        total_motions=len(specs),
+        total_frames=total_frames,
+        start=progress_start,
+    )
     print(f"processed {len(specs)} motions / {total_frames} frames in {elapsed:.3f}s")
     print(f"summary: {summary_path}")
 

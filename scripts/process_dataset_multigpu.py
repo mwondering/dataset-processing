@@ -91,6 +91,78 @@ def tail(path: Path, lines: int = 40) -> str:
     return "\n".join(content[-lines:])
 
 
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None or seconds < 0.0:
+        return "--:--:--"
+    total = int(seconds + 0.5)
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def build_progress_lines(
+    plan: dict[str, Any],
+    workers: list[dict[str, Any]],
+    states: list[dict[str, Any]],
+    *,
+    elapsed: float,
+    bar_width: int = 30,
+) -> list[str]:
+    completed_motions = sum(int(state.get("completed_motion_count", 0)) for state in states)
+    completed_frames = sum(int(state.get("completed_frame_count", 0)) for state in states)
+    total_motions = int(plan["motion_count"])
+    total_frames = int(plan["frame_count"])
+    completed_motions = min(completed_motions, total_motions)
+    completed_frames = min(completed_frames, total_frames)
+    ratio = completed_frames / total_frames if total_frames else 1.0
+    filled = min(bar_width, int(ratio * bar_width + 0.5))
+    speed = completed_frames / elapsed if elapsed > 0.0 else 0.0
+    eta = (total_frames - completed_frames) / speed if speed > 0.0 else None
+
+    lines = [
+        f"overall  {ratio * 100:5.1f}% │{'█' * filled}{'─' * (bar_width - filled)}│",
+        f"motions  {completed_motions:,} / {total_motions:,}",
+        f"frames   {completed_frames:,} / {total_frames:,}",
+        f"speed    {speed:,.0f} frame/s",
+        f"ETA      {_format_duration(eta)}",
+    ]
+    for worker, state in zip(workers, states):
+        worker_total = int(worker["motion_count"])
+        worker_done = min(int(state.get("completed_motion_count", 0)), worker_total)
+        lines.append(f"GPU{worker['gpu_id']:<3}   {worker_done:,} / {worker_total:,} motions")
+    return lines
+
+
+def read_progress_states(workers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    states: list[dict[str, Any]] = []
+    for worker in workers:
+        try:
+            states.append(json.loads(worker["progress"].read_text(encoding="utf-8")))
+        except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError, ValueError):
+            states.append({})
+    return states
+
+
+class ProgressRenderer:
+    def __init__(self, stream: Any = sys.stdout):
+        self.stream = stream
+        self.is_tty = bool(stream.isatty())
+        self.previous_line_count = 0
+
+    def render(self, lines: list[str]) -> None:
+        if self.is_tty:
+            if self.previous_line_count:
+                self.stream.write(f"\x1b[{self.previous_line_count}F")
+            for line in lines:
+                self.stream.write(f"\x1b[2K{line}\n")
+            for _ in range(max(0, self.previous_line_count - len(lines))):
+                self.stream.write("\x1b[2K\n")
+            self.previous_line_count = len(lines)
+        else:
+            self.stream.write("\n".join(lines) + "\n")
+        self.stream.flush()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
@@ -102,6 +174,12 @@ def main() -> None:
     parser.add_argument("--batch-motions", type=int, default=32)
     parser.add_argument("--io-workers-per-gpu", type=int, default=4)
     parser.add_argument("--scan-workers", type=int, default=16)
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        help="Refresh seconds; default is 1 in a terminal and 10 in redirected/Slurm logs.",
+    )
+    parser.add_argument("--no-progress", action="store_true", help="Disable the aggregate progress display.")
     write_mode = parser.add_mutually_exclusive_group()
     write_mode.add_argument("--overwrite", action="store_true")
     write_mode.add_argument("--skip-existing", action="store_true")
@@ -112,6 +190,8 @@ def main() -> None:
         raise ValueError("Batch limits must be positive")
     if args.io_workers_per_gpu < 1 or args.scan_workers < 1:
         raise ValueError("Worker counts must be positive")
+    if args.progress_interval is not None and args.progress_interval <= 0.0:
+        raise ValueError("--progress-interval must be positive")
 
     input_root = args.input.expanduser().resolve()
     output_root = args.output_dir.expanduser().resolve()
@@ -152,6 +232,7 @@ def main() -> None:
         manifest = cluster_dir / f"manifest.gpu{gpu_id}.txt"
         manifest.write_text("".join(f"{spec.path.absolute()}\n" for spec in shard), encoding="utf-8")
         log_path = cluster_dir / f"worker.gpu{gpu_id}.log"
+        progress_path = cluster_dir / f"progress.gpu{gpu_id}.json"
         summary_name = Path("_cluster") / f"summary.gpu{gpu_id}.json"
         command = [
             sys.executable,
@@ -160,6 +241,7 @@ def main() -> None:
             "--manifest", str(manifest),
             "--output-dir", str(output_root),
             "--summary-name", str(summary_name),
+            "--progress-path", str(progress_path),
             "--device", f"cuda:{gpu_id}",
             "--input-key", args.input_key,
             "--batch-frames", str(args.batch_frames),
@@ -179,6 +261,7 @@ def main() -> None:
                 "frame_count": frame_count,
                 "manifest": manifest,
                 "log": log_path,
+                "progress": progress_path,
                 "summary": output_root / summary_name,
                 "command": command,
             }
@@ -212,6 +295,7 @@ def main() -> None:
     child_env = os.environ.copy()
     child_env.setdefault("OMP_NUM_THREADS", "1")
     for item in worker_specs:
+        item["progress"].unlink(missing_ok=True)
         log_stream = item["log"].open("w", encoding="utf-8")
         process = subprocess.Popen(
             item["command"],
@@ -223,6 +307,11 @@ def main() -> None:
 
     failed: tuple[dict[str, Any], int] | None = None
     active = list(processes)
+    renderer = ProgressRenderer()
+    progress_interval = args.progress_interval
+    if progress_interval is None:
+        progress_interval = 1.0 if renderer.is_tty else 10.0
+    last_render = float("-inf")
     while active:
         for entry in list(active):
             item, process, log_stream = entry
@@ -235,12 +324,32 @@ def main() -> None:
                 failed = (item, code)
                 for _, other, _ in active:
                     other.terminate()
+        now = time.perf_counter()
+        if not args.no_progress and now - last_render >= progress_interval:
+            renderer.render(
+                build_progress_lines(
+                    plan,
+                    worker_specs,
+                    read_progress_states(worker_specs),
+                    elapsed=now - start,
+                )
+            )
+            last_render = now
         if active:
             time.sleep(0.2)
     for _, process, log_stream in processes:
         process.wait()
         if not log_stream.closed:
             log_stream.close()
+    if not args.no_progress:
+        renderer.render(
+            build_progress_lines(
+                plan,
+                worker_specs,
+                read_progress_states(worker_specs),
+                elapsed=time.perf_counter() - start,
+            )
+        )
     if failed is not None:
         item, code = failed
         raise RuntimeError(

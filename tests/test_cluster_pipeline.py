@@ -5,7 +5,11 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from fk_compare.g1_fk import G1PureTorchFK
-from scripts.process_dataset_multigpu import balanced_shards, merge_global_differences
+from scripts.process_dataset_multigpu import (
+    balanced_shards,
+    build_progress_lines,
+    merge_global_differences,
+)
 
 
 def test_embedded_g1_fk_zero_pose_contract():
@@ -48,3 +52,25 @@ def test_merge_global_differences_uses_weighted_moments():
     assert result["mean"] == pytest.approx(4.0 / 3.0)
     assert result["rmse"] == pytest.approx(2.0**0.5)
     assert result["max"] == 2.0
+
+
+def test_global_progress_aggregates_worker_frames_and_motions():
+    plan = {"motion_count": 20, "frame_count": 2_000}
+    workers = [
+        {"gpu_id": 0, "motion_count": 10},
+        {"gpu_id": 1, "motion_count": 10},
+    ]
+    states = [
+        {"completed_motion_count": 4, "completed_frame_count": 400},
+        {"completed_motion_count": 6, "completed_frame_count": 500},
+    ]
+
+    lines = build_progress_lines(plan, workers, states, elapsed=10.0)
+
+    assert lines[0].startswith("overall   45.0%")
+    assert lines[1] == "motions  10 / 20"
+    assert lines[2] == "frames   900 / 2,000"
+    assert lines[3] == "speed    90 frame/s"
+    assert lines[4] == "ETA      00:00:12"
+    assert lines[5] == "GPU0     4 / 10 motions"
+    assert lines[6] == "GPU1     6 / 10 motions"
