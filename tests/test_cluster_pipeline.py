@@ -1,14 +1,21 @@
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
 
 from fk_compare.g1_fk import G1PureTorchFK
+from scripts.process_isaaclab_pos36 import MotionSpec, read_spec_manifest
 from scripts.process_dataset_multigpu import (
     balanced_shards,
     build_progress_lines,
+    discover_inputs_fast,
+    load_dataset_index,
     merge_global_differences,
+    read_motion_specs,
+    write_dataset_index,
+    write_spec_manifest,
 )
 
 
@@ -74,3 +81,72 @@ def test_global_progress_aggregates_worker_frames_and_motions():
     assert lines[4] == "ETA      00:00:12"
     assert lines[5] == "GPU0     4 / 10 motions"
     assert lines[6] == "GPU1     6 / 10 motions"
+
+
+def test_python_scanner_preserves_motion_npz_preference(tmp_path):
+    motion = tmp_path / "a" / "motion.npz"
+    unrelated = tmp_path / "b" / "clip.npz"
+    motion.parent.mkdir(parents=True)
+    unrelated.parent.mkdir(parents=True)
+    motion.touch()
+    unrelated.touch()
+
+    paths = discover_inputs_fast(
+        tmp_path,
+        backend="python",
+        workers=2,
+        fd_executable=None,
+        log_interval=0.0,
+    )
+
+    assert paths == [motion]
+
+
+def test_dataset_index_and_worker_spec_manifest_round_trip(tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    specs = [
+        MotionSpec(path=input_root / "a" / "motion.npz", length=11, fps=50.0, kind="data10k"),
+        MotionSpec(path=input_root / "b.npy", length=7, fps=60.0, kind="pos36"),
+    ]
+    index_path = tmp_path / "index.json"
+    manifest_path = tmp_path / "manifest.json"
+
+    write_dataset_index(
+        index_path,
+        input_root=input_root,
+        input_key="pos",
+        fallback_fps=None,
+        specs=specs,
+    )
+    cached = load_dataset_index(
+        index_path,
+        input_root=input_root,
+        input_key="pos",
+        fallback_fps=None,
+    )
+    write_spec_manifest(manifest_path, specs)
+
+    assert cached == specs
+    assert read_spec_manifest(manifest_path) == specs
+
+
+def test_process_metadata_reader_preserves_input_order(tmp_path):
+    paths = []
+    for index, length in enumerate((5, 3, 7)):
+        path = tmp_path / f"motion_{index}.npz"
+        np.savez(path, pos=np.zeros((length, 36), dtype=np.float32), fps=np.asarray([50]))
+        paths.append(path)
+
+    specs = read_motion_specs(
+        paths,
+        input_key="pos",
+        fallback_fps=None,
+        backend="process",
+        workers=2,
+        chunksize=2,
+        log_interval=0.0,
+    )
+
+    assert [spec.path for spec in specs] == paths
+    assert [spec.length for spec in specs] == [5, 3, 7]

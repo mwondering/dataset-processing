@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import multiprocessing as mp
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -17,8 +19,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.process_isaaclab_pos36 import (  # noqa: E402
+    MotionSpec,
     _atomic_write_json,
-    discover_inputs,
     inspect_motion,
     output_path_for,
 )
@@ -89,6 +91,328 @@ def merge_global_differences(summaries: list[dict[str, Any]]) -> dict[str, Any]:
 def tail(path: Path, lines: int = 40) -> str:
     content = path.read_text(encoding="utf-8", errors="replace").splitlines()
     return "\n".join(content[-lines:])
+
+
+def _prefer_motion_npz(paths: list[Path]) -> list[Path]:
+    motion_paths = [path for path in paths if path.name == "motion.npz"]
+    selected = motion_paths if motion_paths else paths
+    if not selected:
+        raise RuntimeError("No .npz or .npy motions found")
+    return sorted(selected)
+
+
+def _collect_motion_files_os_walk(root: Path) -> tuple[list[Path], int, int]:
+    paths: list[Path] = []
+    directory_count = 0
+    file_count = 0
+    for directory, _, filenames in os.walk(root):
+        directory_count += 1
+        file_count += len(filenames)
+        for filename in filenames:
+            if filename.endswith((".npz", ".npy")):
+                paths.append(Path(directory) / filename)
+    return paths, directory_count, file_count
+
+
+def _scan_inputs_python(root: Path, *, workers: int, log_interval: float) -> list[Path]:
+    start = time.perf_counter()
+    print(f"path scan start: backend=python workers={workers} root={root}", flush=True)
+    with os.scandir(root) as entries:
+        root_files: list[Path] = []
+        child_dirs: list[Path] = []
+        root_file_count = 0
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                child_dirs.append(Path(entry.path))
+            else:
+                root_file_count += 1
+                if entry.name.endswith((".npz", ".npy")):
+                    root_files.append(Path(entry.path))
+
+    paths = list(root_files)
+    directory_count = 1
+    file_count = root_file_count
+    last_log = start
+    if workers > 1 and len(child_dirs) > 1:
+        worker_count = min(workers, len(child_dirs))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(_collect_motion_files_os_walk, child) for child in child_dirs]
+            for completed, future in enumerate(as_completed(futures), start=1):
+                child_paths, child_directory_count, child_file_count = future.result()
+                paths.extend(child_paths)
+                directory_count += child_directory_count
+                file_count += child_file_count
+                now = time.perf_counter()
+                if log_interval > 0.0 and now - last_log >= log_interval:
+                    print(
+                        "path scan progress: "
+                        f"dirs={directory_count:,} files={file_count:,} motions={len(paths):,} "
+                        f"roots={completed}/{len(child_dirs)} elapsed={now - start:.1f}s",
+                        flush=True,
+                    )
+                    last_log = now
+    else:
+        child_paths, child_directory_count, child_file_count = _collect_motion_files_os_walk(root)
+        paths = child_paths
+        directory_count = child_directory_count
+        file_count = child_file_count
+
+    selected = _prefer_motion_npz(paths)
+    print(
+        f"path scan done: backend=python dirs={directory_count:,} files={file_count:,} "
+        f"motions={len(selected):,} elapsed={time.perf_counter() - start:.2f}s",
+        flush=True,
+    )
+    return selected
+
+
+def _find_fd(executable: str | None) -> str | None:
+    candidates = [executable] if executable else ["fd", "fdfind"]
+    for candidate in candidates:
+        if candidate:
+            resolved = shutil.which(candidate)
+            if resolved:
+                return resolved
+    return None
+
+
+def _scan_inputs_fd(
+    root: Path,
+    *,
+    executable: str,
+    workers: int,
+    log_interval: float,
+) -> list[Path]:
+    start = time.perf_counter()
+    command = [
+        executable,
+        "--hidden",
+        "--no-ignore",
+        "--type",
+        "f",
+        "--color",
+        "never",
+    ]
+    if workers > 0:
+        command.extend(("--threads", str(workers)))
+    command.extend((r"\.(npz|npy)$", str(root)))
+    print(f"path scan start: backend=fd workers={workers} root={root}", flush=True)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    paths: list[Path] = []
+    last_log = start
+    assert process.stdout is not None
+    for line in process.stdout:
+        value = line.strip()
+        if value:
+            paths.append(Path(value).absolute())
+        now = time.perf_counter()
+        if log_interval > 0.0 and now - last_log >= log_interval:
+            print(
+                f"path scan progress: backend=fd motions={len(paths):,} elapsed={now - start:.1f}s",
+                flush=True,
+            )
+            last_log = now
+    stderr = process.stderr.read() if process.stderr is not None else ""
+    code = process.wait()
+    if code != 0:
+        raise subprocess.CalledProcessError(code, command, stderr=stderr)
+    selected = _prefer_motion_npz(paths)
+    print(
+        f"path scan done: backend=fd motions={len(selected):,} "
+        f"elapsed={time.perf_counter() - start:.2f}s",
+        flush=True,
+    )
+    return selected
+
+
+def discover_inputs_fast(
+    root: Path,
+    *,
+    backend: str,
+    workers: int,
+    fd_executable: str | None,
+    log_interval: float,
+) -> list[Path]:
+    if root.is_file():
+        if root.suffix not in (".npz", ".npy"):
+            raise ValueError(f"Only .npz and .npy inputs are supported: {root}")
+        return [root]
+    if backend not in ("auto", "fd", "python"):
+        raise ValueError(f"Unsupported scan backend: {backend}")
+    if backend in ("auto", "fd"):
+        fd_path = _find_fd(fd_executable)
+        if fd_path:
+            try:
+                return _scan_inputs_fd(
+                    root,
+                    executable=fd_path,
+                    workers=workers,
+                    log_interval=log_interval,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                if backend == "fd":
+                    raise RuntimeError(f"fd input scan failed: {error}") from error
+                print(f"fd scan failed; falling back to Python: {error}", flush=True)
+        elif backend == "fd":
+            requested = fd_executable or "fd/fdfind"
+            raise FileNotFoundError(f"scan backend 'fd' requested but executable was not found: {requested}")
+    return _scan_inputs_python(root, workers=workers, log_interval=log_interval)
+
+
+def _inspect_motion_job(
+    job: tuple[int, str, str, float | None],
+) -> tuple[int, MotionSpec]:
+    index, path, input_key, fallback_fps = job
+    return index, inspect_motion(Path(path), input_key=input_key, fallback_fps=fallback_fps)
+
+
+def read_motion_specs(
+    paths: list[Path],
+    *,
+    input_key: str,
+    fallback_fps: float | None,
+    backend: str,
+    workers: int,
+    chunksize: int,
+    log_interval: float,
+) -> list[MotionSpec]:
+    total = len(paths)
+    worker_count = min(max(workers, 1), total)
+    resolved_backend = "serial" if backend == "serial" or worker_count <= 1 else backend
+    print(
+        f"metadata read start: count={total:,} backend={resolved_backend} "
+        f"workers={worker_count} chunksize={chunksize}",
+        flush=True,
+    )
+    start = time.perf_counter()
+    last_log = start
+    specs: list[MotionSpec | None] = [None] * total
+    completed = 0
+
+    def record(index: int, spec: MotionSpec) -> None:
+        nonlocal completed, last_log
+        specs[index] = spec
+        completed += 1
+        now = time.perf_counter()
+        if completed == total or (log_interval > 0.0 and now - last_log >= log_interval):
+            rate = completed / (now - start) if now > start else 0.0
+            print(
+                f"metadata progress: {completed:,}/{total:,} files "
+                f"({completed / total * 100:.1f}%) {rate:,.0f} file/s "
+                f"elapsed={now - start:.1f}s",
+                flush=True,
+            )
+            last_log = now
+
+    jobs = ((index, str(path), input_key, fallback_fps) for index, path in enumerate(paths))
+    if resolved_backend == "serial":
+        for job in jobs:
+            index, spec = _inspect_motion_job(job)
+            record(index, spec)
+    elif resolved_backend == "process":
+        with mp.Pool(processes=worker_count) as pool:
+            for index, spec in pool.imap_unordered(_inspect_motion_job, jobs, chunksize=chunksize):
+                record(index, spec)
+    elif resolved_backend == "thread":
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(_inspect_motion_job, job) for job in jobs]
+            for future in as_completed(futures):
+                index, spec = future.result()
+                record(index, spec)
+    else:
+        raise ValueError(f"Unsupported metadata backend: {backend}")
+
+    if any(spec is None for spec in specs):
+        raise RuntimeError("Metadata reader returned an incomplete result")
+    print(f"metadata read done: {total:,} files in {time.perf_counter() - start:.2f}s", flush=True)
+    return [spec for spec in specs if spec is not None]
+
+
+def load_dataset_index(
+    path: Path,
+    *,
+    input_root: Path,
+    input_key: str,
+    fallback_fps: float | None,
+) -> list[MotionSpec] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if int(payload["version"]) != 1:
+            return None
+        if payload["input"] != str(input_root) or payload["input_key"] != input_key:
+            return None
+        if payload.get("fallback_fps") != fallback_fps:
+            return None
+        specs = [
+            MotionSpec(
+                path=Path(raw["path"]),
+                length=int(raw["length"]),
+                fps=float(raw["fps"]),
+                kind=str(raw["kind"]),
+            )
+            for raw in payload["motions"]
+        ]
+        if not specs or any(spec.length < 1 or spec.kind not in ("data10k", "pos36") for spec in specs):
+            return None
+        return specs
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        print(f"dataset index ignored: file={path} error={error}", flush=True)
+        return None
+
+
+def write_dataset_index(
+    path: Path,
+    *,
+    input_root: Path,
+    input_key: str,
+    fallback_fps: float | None,
+    specs: list[MotionSpec],
+) -> None:
+    _atomic_write_json(
+        path,
+        {
+            "version": 1,
+            "input": str(input_root),
+            "input_key": input_key,
+            "fallback_fps": fallback_fps,
+            "motion_count": len(specs),
+            "frame_count": sum(spec.length for spec in specs),
+            "motions": [
+                {
+                    "path": str(spec.path),
+                    "length": spec.length,
+                    "fps": spec.fps,
+                    "kind": spec.kind,
+                }
+                for spec in specs
+            ],
+        },
+    )
+
+
+def write_spec_manifest(path: Path, specs: list[MotionSpec]) -> None:
+    _atomic_write_json(
+        path,
+        {
+            "version": 1,
+            "motions": [
+                {
+                    "path": str(spec.path),
+                    "length": spec.length,
+                    "fps": spec.fps,
+                    "kind": spec.kind,
+                }
+                for spec in specs
+            ],
+        },
+    )
 
 
 def _format_duration(seconds: float | None) -> str:
@@ -173,7 +497,35 @@ def main() -> None:
     parser.add_argument("--batch-frames", type=int, default=262144)
     parser.add_argument("--batch-motions", type=int, default=32)
     parser.add_argument("--io-workers-per-gpu", type=int, default=4)
-    parser.add_argument("--scan-workers", type=int, default=16)
+    parser.add_argument(
+        "--scan-workers",
+        type=int,
+        default=16,
+        help="Workers for filesystem enumeration, metadata reads, and existing-output checks.",
+    )
+    parser.add_argument("--scan-backend", choices=("auto", "fd", "python"), default="auto")
+    parser.add_argument(
+        "--scan-fd-executable",
+        help="fd executable name/path; auto mode searches both fd and fdfind.",
+    )
+    parser.add_argument(
+        "--metadata-read-backend",
+        choices=("process", "thread", "serial"),
+        default="process",
+    )
+    parser.add_argument("--metadata-read-chunksize", type=int, default=128)
+    parser.add_argument("--scan-log-interval", type=float, default=10.0)
+    parser.add_argument(
+        "--index-cache",
+        type=Path,
+        help="Persistent dataset index; default is OUTPUT/_cluster/input_index.json.",
+    )
+    parser.add_argument("--no-index-cache", action="store_true")
+    parser.add_argument(
+        "--rebuild-index",
+        action="store_true",
+        help="Ignore and replace the cached input snapshot after the source dataset changes.",
+    )
     parser.add_argument(
         "--progress-interval",
         type=float,
@@ -190,6 +542,14 @@ def main() -> None:
         raise ValueError("Batch limits must be positive")
     if args.io_workers_per_gpu < 1 or args.scan_workers < 1:
         raise ValueError("Worker counts must be positive")
+    if args.metadata_read_chunksize < 1:
+        raise ValueError("--metadata-read-chunksize must be positive")
+    if args.scan_log_interval < 0.0:
+        raise ValueError("--scan-log-interval must be non-negative")
+    if args.no_index_cache and args.index_cache:
+        raise ValueError("--index-cache and --no-index-cache cannot be combined")
+    if args.no_index_cache and args.rebuild_index:
+        raise ValueError("--rebuild-index has no effect with --no-index-cache")
     if args.progress_interval is not None and args.progress_interval <= 0.0:
         raise ValueError("--progress-interval must be positive")
 
@@ -197,40 +557,92 @@ def main() -> None:
     output_root = args.output_dir.expanduser().resolve()
     if not input_root.exists():
         raise FileNotFoundError(input_root)
-    gpu_ids = parse_gpu_ids(args.gpus)
-    paths = discover_inputs(input_root)
+
+    output_preexisting = output_root.exists()
+    cluster_dir = output_root / "_cluster"
+    cluster_dir.mkdir(parents=True, exist_ok=True)
+    index_path = (
+        args.index_cache.expanduser().resolve()
+        if args.index_cache
+        else cluster_dir / "input_index.json"
+    )
+    specs = None
+    index_hit = False
+    if not args.no_index_cache and not args.rebuild_index:
+        specs = load_dataset_index(
+            index_path,
+            input_root=input_root,
+            input_key=args.input_key,
+            fallback_fps=args.fps,
+        )
+        index_hit = specs is not None
+    if specs is not None:
+        print(
+            f"dataset index hit: {len(specs):,} motions / "
+            f"{sum(spec.length for spec in specs):,} frames <- {index_path}",
+            flush=True,
+        )
+        print("dataset index is a snapshot; use --rebuild-index after changing input files", flush=True)
+    else:
+        print(f"dataset index build start: cache={index_path if not args.no_index_cache else 'disabled'}", flush=True)
+        paths = discover_inputs_fast(
+            input_root,
+            backend=args.scan_backend,
+            workers=args.scan_workers,
+            fd_executable=args.scan_fd_executable,
+            log_interval=args.scan_log_interval,
+        )
+        specs = read_motion_specs(
+            paths,
+            input_key=args.input_key,
+            fallback_fps=args.fps,
+            backend=args.metadata_read_backend,
+            workers=args.scan_workers,
+            chunksize=args.metadata_read_chunksize,
+            log_interval=args.scan_log_interval,
+        )
+        if not args.no_index_cache:
+            write_dataset_index(
+                index_path,
+                input_root=input_root,
+                input_key=args.input_key,
+                fallback_fps=args.fps,
+                specs=specs,
+            )
+            print(f"dataset index wrote: {index_path}", flush=True)
 
     skipped_existing = 0
     if args.skip_existing:
-        pending = []
-        for path in paths:
-            if output_path_for(input_root, output_root, path).exists():
-                skipped_existing += 1
-            else:
-                pending.append(path)
-        paths = pending
-    if not paths:
+        if output_preexisting:
+            start = time.perf_counter()
+            print(f"existing-output check start: {len(specs):,} motions", flush=True)
+            expected_outputs = [output_path_for(input_root, output_root, spec.path) for spec in specs]
+            with ThreadPoolExecutor(max_workers=args.scan_workers) as executor:
+                existing = list(executor.map(Path.exists, expected_outputs))
+            pending_specs = [spec for spec, output_exists in zip(specs, existing) if not output_exists]
+            skipped_existing = len(specs) - len(pending_specs)
+            specs = pending_specs
+            print(
+                f"existing-output check done: skipped={skipped_existing:,} "
+                f"pending={len(specs):,} elapsed={time.perf_counter() - start:.2f}s",
+                flush=True,
+            )
+    if not specs:
         print(f"nothing to process; skipped {skipped_existing} existing motions")
         return
 
-    with ThreadPoolExecutor(max_workers=args.scan_workers) as executor:
-        specs = list(
-            executor.map(
-                lambda path: inspect_motion(path, input_key=args.input_key, fallback_fps=args.fps),
-                paths,
-            )
-        )
+    # CUDA is queried only after the optional process-based metadata pool exits.
+    # This avoids forking worker processes after CUDA runtime initialization.
+    gpu_ids = parse_gpu_ids(args.gpus)
     shards, frame_loads = balanced_shards(specs, len(gpu_ids))
 
-    cluster_dir = output_root / "_cluster"
-    cluster_dir.mkdir(parents=True, exist_ok=True)
     worker_script = Path(__file__).with_name("process_isaaclab_pos36.py").resolve()
     worker_specs: list[dict[str, Any]] = []
     for gpu_id, shard, frame_count in zip(gpu_ids, shards, frame_loads):
         if not shard:
             continue
-        manifest = cluster_dir / f"manifest.gpu{gpu_id}.txt"
-        manifest.write_text("".join(f"{spec.path.absolute()}\n" for spec in shard), encoding="utf-8")
+        manifest = cluster_dir / f"manifest.gpu{gpu_id}.json"
+        write_spec_manifest(manifest, shard)
         log_path = cluster_dir / f"worker.gpu{gpu_id}.log"
         progress_path = cluster_dir / f"progress.gpu{gpu_id}.json"
         summary_name = Path("_cluster") / f"summary.gpu{gpu_id}.json"
@@ -238,7 +650,7 @@ def main() -> None:
             sys.executable,
             str(worker_script),
             "--input", str(input_root),
-            "--manifest", str(manifest),
+            "--spec-manifest", str(manifest),
             "--output-dir", str(output_root),
             "--summary-name", str(summary_name),
             "--progress-path", str(progress_path),
@@ -275,6 +687,10 @@ def main() -> None:
         "motion_count": len(specs),
         "frame_count": sum(spec.length for spec in specs),
         "skipped_existing_motion_count": skipped_existing,
+        "dataset_index": None if args.no_index_cache else str(index_path),
+        "dataset_index_hit": index_hit,
+        "scan_backend": args.scan_backend,
+        "metadata_read_backend": args.metadata_read_backend,
         "workers": [
             {key: str(value) if isinstance(value, Path) else value for key, value in item.items() if key != "command"}
             for item in worker_specs

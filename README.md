@@ -124,6 +124,8 @@ uv run --frozen python scripts/process_dataset_multigpu.py \
   --batch-motions 32 \
   --io-workers-per-gpu 4 \
   --scan-workers 16 \
+  --metadata-read-backend process \
+  --metadata-read-chunksize 128 \
   --progress-interval 2 \
   --skip-existing
 ```
@@ -143,6 +145,24 @@ Use `--progress-interval SECONDS` to override either default or `--no-progress`
 to disable it.  Each output file is written
 atomically, so `--skip-existing` safely resumes an interrupted job.  Use
 `--dry-run` to inspect the sharding plan without starting workers.
+
+Large dataset startup follows the same indexing strategy as SP_Tracking's
+LargeDataset loader.  In `--scan-backend auto` mode the launcher first uses
+`fd` or Debian's `fdfind` when either is available, otherwise it falls back to
+a parallel `os.walk`.  NPZ length/FPS metadata is read once with a process pool
+(the default), then embedded in each GPU's JSON manifest so workers do not scan
+the files again.  The complete snapshot is atomically cached at
+`OUTPUT/_cluster/input_index.json`; resumed runs load it directly and only
+check which outputs already exist.  Startup prints separate path-scan,
+metadata-read, and existing-output progress with elapsed time and file rate.
+
+The index is intentionally a snapshot, matching a reusable manifest.  After
+adding, removing, replacing, or editing source motions, pass `--rebuild-index`.
+Use `--no-index-cache` for a fresh scan on every launch, or `--index-cache PATH`
+to share one index across output directories.  On storage where multiple
+processes perform worse, switch to `--metadata-read-backend thread`; tune
+`--scan-workers` and `--metadata-read-chunksize` independently of GPU batch
+sizes.
 
 Each rebuilt `motion.npz` has a `motion.diff.json` sidecar containing exact
 per-file statistics for:

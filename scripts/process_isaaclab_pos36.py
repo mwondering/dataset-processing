@@ -195,6 +195,38 @@ def read_manifest(path: Path) -> list[Path]:
     return paths
 
 
+def read_spec_manifest(path: Path) -> list[MotionSpec]:
+    """Read a launcher-generated manifest without reopening every source NPZ."""
+
+    manifest = path.expanduser().resolve()
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    if int(payload.get("version", 0)) != 1:
+        raise ValueError(f"Unsupported spec manifest version: {manifest}")
+    raw_specs = payload.get("motions")
+    if not isinstance(raw_specs, list) or not raw_specs:
+        raise ValueError(f"Spec manifest contains no motions: {manifest}")
+
+    specs: list[MotionSpec] = []
+    for index, raw in enumerate(raw_specs):
+        try:
+            item = Path(raw["path"]).expanduser()
+            if not item.is_absolute():
+                item = manifest.parent / item
+            length = int(raw["length"])
+            fps = float(raw["fps"])
+            kind = str(raw["kind"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"Invalid motion entry {index} in {manifest}") from error
+        if item.suffix not in (".npz", ".npy") or length < 1 or not np.isfinite(fps) or fps <= 0.0:
+            raise ValueError(f"Invalid motion entry {index} in {manifest}: {raw!r}")
+        if kind not in ("data10k", "pos36"):
+            raise ValueError(f"Invalid motion kind in {manifest}: {kind!r}")
+        specs.append(MotionSpec(path=item.absolute(), length=length, fps=fps, kind=kind))
+    if len({spec.path for spec in specs}) != len(specs):
+        raise ValueError(f"Spec manifest contains duplicate paths: {manifest}")
+    return specs
+
+
 def make_batches(specs: list[MotionSpec], *, max_padded_frames: int, max_motions: int) -> list[list[MotionSpec]]:
     if max_padded_frames < 1 or max_motions < 1:
         raise ValueError("Batch limits must be positive")
@@ -404,7 +436,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True, help="One motion or a directory tree.")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--manifest", type=Path, help="Optional newline-delimited subset of input files.")
+    input_subset = parser.add_mutually_exclusive_group()
+    input_subset.add_argument("--manifest", type=Path, help="Optional newline-delimited subset of input files.")
+    input_subset.add_argument(
+        "--spec-manifest",
+        type=Path,
+        help="Launcher-generated JSON manifest containing validated length/FPS metadata.",
+    )
     parser.add_argument("--summary-name", type=Path, default=Path("summary.json"))
     parser.add_argument("--progress-path", type=Path, help="Optional atomic worker-progress JSON path.")
     parser.add_argument("--device", default="cuda", help="Torch device, normally cuda or cuda:0.")
@@ -431,18 +469,21 @@ def main() -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable; use --device cpu only for validation")
 
-    paths = read_manifest(args.manifest) if args.manifest else discover_inputs(input_root)
-    for path in paths:
-        try:
-            path.relative_to(input_root if input_root.is_dir() else input_root.parent)
-        except ValueError as error:
-            raise ValueError(f"Manifest input is outside --input: {path}") from error
-    with ThreadPoolExecutor(max_workers=args.io_workers) as executor:
-        specs = list(
-            executor.map(
-                lambda path: inspect_motion(path, input_key=args.input_key, fallback_fps=args.fps), paths
+    if args.spec_manifest:
+        specs = read_spec_manifest(args.spec_manifest)
+    else:
+        paths = read_manifest(args.manifest) if args.manifest else discover_inputs(input_root)
+        with ThreadPoolExecutor(max_workers=args.io_workers) as executor:
+            specs = list(
+                executor.map(
+                    lambda path: inspect_motion(path, input_key=args.input_key, fallback_fps=args.fps), paths
+                )
             )
-        )
+    for spec in specs:
+        try:
+            spec.path.relative_to(input_root if input_root.is_dir() else input_root.parent)
+        except ValueError as error:
+            raise ValueError(f"Manifest input is outside --input: {spec.path}") from error
     if any(spec.length < 1 for spec in specs):
         raise ValueError("Empty motions are not supported")
     discovered_motion_count = len(specs)
@@ -530,7 +571,9 @@ def main() -> None:
         "fk_asset": fk_helper.asset_name,
         "runtime_dependencies": ["numpy", "torch"],
         "device": str(device),
-        "manifest": str(args.manifest.expanduser().resolve()) if args.manifest else None,
+        "manifest": str((args.spec_manifest or args.manifest).expanduser().resolve())
+        if args.spec_manifest or args.manifest
+        else None,
         "discovered_motion_count": discovered_motion_count,
         "skipped_existing_motion_count": skipped_motion_count,
         "motion_count": len(specs),
